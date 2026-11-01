@@ -110,7 +110,7 @@ class SoundEvents:
 
     def scores(self, patch):
         out = self.session.run(None, {self.input: patch[None, None].astype(np.float32)})[0][0]
-        probs = 1.0 / (1.0 + np.exp(-out))
+        probs = 0.5 * (1.0 + np.tanh(0.5 * out))
         return [float(probs[idx].max()) for idx in self.index]
 
     def detect(self, path):

@@ -6,7 +6,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY *.py ./
-ENV TAPO_DATA=/data PYTHONUNBUFFERED=1 FFMPEG=/usr/bin/ffmpeg
+ENV TAPO_DATA=/data PYTHONUNBUFFERED=1 FFMPEG=/usr/bin/ffmpeg MALLOC_ARENA_MAX=2
 RUN useradd -u 1000 -m tapo && mkdir -p /data && chown tapo /data
 USER tapo
 ENTRYPOINT ["python", "-u"]

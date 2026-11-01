@@ -29,7 +29,6 @@ Tapo cameras record to a microSD card that fills up, and the only remote access 
 2. For every file, in order:
    - the overlay clock is read from keyframes with digit templates calibrated automatically per resolution and font (tesseract boxes on first sight, then a fast vectorized matcher); jumps between motion events become chapters;
    - the video is remuxed with `faststart`, audio goes to AAC;
-   - a sample of frames goes through an NSFW classifier; flagged videos are posted as Telegram spoilers with an `18+` mark;
    - the posting bot uploads the file in parallel parts and posts it into the camera topic.
 3. The speech stream takes the same files from a bounded queue, in the same order:
    - GigaAM v3 transcription with a level and VAD gate, silence compaction and word timestamps;
@@ -83,6 +82,8 @@ python archive.py summary         # what will be posted
 python archive.py process         # run both streams
 python archive.py process --dry-run --limit 3
 python archive.py reset --yes --speech-only   # delete speech posts and redo them
+python archive.py reset --yes --from 20241002_230019_tp00168.mp4   # redo one camera's posts from this file on, in order
+python archive.py reset --yes --speech-only --from 20240928_213340_tp00135.mp4   # same for speech posts only
 python backup.py run              # daily cloud backup loop
 python backup.py day --camera C200 --date 20261028 --no-upload
 ```
@@ -117,7 +118,6 @@ Captions, transcripts and topic names are Russian on purpose: the cameras and th
 2. Для каждого файла по порядку:
    - время с оверлея читается по ключевым кадрам шаблонами цифр, которые калибруются автоматически под разрешение и шрифт (рамки tesseract при первой встрече, дальше быстрый векторный поиск); скачки между событиями движения становятся главами;
    - видео пересобирается с `faststart`, звук в AAC;
-   - выборка кадров проходит классификатор NSFW; отмеченные видео публикуются спойлером Telegram с пометкой `18+`;
    - бот-публикатор заливает файл параллельными частями и публикует его в тему камеры.
 3. Поток речи берёт те же файлы из ограниченной очереди в том же порядке:
    - расшифровка GigaAM v3 с отбором по уровню и VAD, вырезанием тишины и временем слов;

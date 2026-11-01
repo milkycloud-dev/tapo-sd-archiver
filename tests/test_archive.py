@@ -359,15 +359,14 @@ class MediaAndCleanupTests(unittest.TestCase):
         item = {"id": 1, "name": "20240727_134245_tp00003.mp4", "start": START.isoformat()}
         with mock.patch.object(archive, "analyze", side_effect=RuntimeError("boom")):
             with self.assertRaises(RuntimeError):
-                archive.prepare(item, self.src, None, mock.Mock(check=mock.Mock(return_value=(False, 0.0, 0))))
+                archive.prepare(item, self.src, None)
         self.assertEqual(list(archive.WORK.iterdir()), [])
 
     def test_prepare_success_leaves_only_outputs(self):
         item = {"id": 1, "name": "20240727_134245_tp00003.mp4", "start": START.isoformat()}
         segs = [event(0, 12, START, START + timedelta(seconds=12))]
         with mock.patch.object(archive, "analyze", return_value=(segs, segs, 1.0, [0.0, 2.0, 4.0])):
-            r = archive.prepare(item, self.src, None, mock.Mock(check=mock.Mock(return_value=(True, 0.97, 3))))
-        self.assertTrue(r["nsfw"])
+            r = archive.prepare(item, self.src, None)
         self.assertFalse(self.src.exists())
         self.assertEqual(sorted(p.name for p in archive.WORK.iterdir()), ["1.faststart.mp4", "1.opus"])
         self.assertEqual(archive.probe(r["audio"])[3]["codec_name"], "opus")
@@ -498,13 +497,11 @@ class ProcessLoopTests(unittest.TestCase):
     def setUp(self):
         self.calls = []
         self.captions = {}
-        self.spoilers = {}
         archive.clear_work()
         if archive.SPEECH_DIR.exists():
             shutil.rmtree(archive.SPEECH_DIR)
 
-    def run_loop(self, failures_before=0, slow_first=False, phrases=None, broken_speech=(), initial=None, sounds=None,
-                 adult=()):
+    def run_loop(self, failures_before=0, slow_first=False, phrases=None, broken_speech=(), initial=None, sounds=None):
         items = [
             {"id": i, "topic": 101, "name": f"20240727_00{i}000_tp0000{i}.mp4", "size": 10, "width": 1920,
              "height": 1080} for i in (1, 2, 3)
@@ -525,7 +522,7 @@ class ProcessLoopTests(unittest.TestCase):
             path.write_bytes(b"x")
             return path
 
-        def fake_prepare(item, src, layouts, nsfw):
+        def fake_prepare(item, src, layouts):
             if slow_first and item["id"] == 1:
                 time.sleep(0.5)
             src.unlink()
@@ -535,31 +532,17 @@ class ProcessLoopTests(unittest.TestCase):
             out.write_bytes(b"v")
             audio = archive.WORK / f"{item['id']}.opus"
             audio.write_bytes(b"a")
-            flagged = str(item["id"]) in adult
             return {"start": start, "duration": 10.0, "width": 1920, "height": 1080, "out": out,
-                    "segments": ev, "events": ev, "quality": 1.0, "keyframes": [0.0, 2.0, 4.0], "audio": audio,
-                    "nsfw": flagged, "nsfw_top": 0.99 if flagged else 0.01}
-
-        def fake_check(path):
-            calls.append(("nsfw check", path.stem))
-            return (path.stem in adult, 0.99 if path.stem in adult else 0.01, 0)
-
-        async def fake_mark(client, chat, message_id):
-            assert client is poster, "editing posts must use the posting bot"
-            calls.append(("mark", message_id))
-
-        nsfw_detector = mock.Mock()
-        nsfw_detector.check.side_effect = fake_check
+                    "segments": ev, "events": ev, "quality": 1.0, "keyframes": [0.0, 2.0, 4.0], "audio": audio}
 
         async def fake_ensure_topic(client, chat, state, name):
             assert client is poster and chat == "chat-post", "topics must use the posting bot"
             return {"Tapo C210": 201, "Tapo C210 субтитры": 203}[name]
 
-        async def fake_upload(client, chat, topic, path, caption, rest, duration, width, height, name, spoiler=False):
+        async def fake_upload(client, chat, topic, path, caption, rest, duration, width, height, name):
             assert client is poster and chat == "chat-post", "upload must use the posting bot"
             assert path.exists()
             calls.append(("upload", topic, name))
-            self.spoilers[name] = spoiler
             self.captions[name] = caption + "\n" + "\n".join(rest)
             return [1000 + len(calls)]
 
@@ -606,8 +589,6 @@ class ProcessLoopTests(unittest.TestCase):
                 mock.patch.object(archive, "prepare", fake_prepare), \
                 mock.patch.object(archive, "Recognizer", mock.Mock(return_value=recognizer)), \
                 mock.patch.object(archive, "SoundEvents", mock.Mock(return_value=detector)), \
-                mock.patch.object(archive, "NsfwDetector", mock.Mock(return_value=nsfw_detector)), \
-                mock.patch.object(archive, "mark_adult", fake_mark), \
                 mock.patch.object(archive, "Layouts", mock.Mock()), \
                 mock.patch.object(archive, "ensure_topic", fake_ensure_topic), \
                 mock.patch.object(archive, "upload", fake_upload), \
@@ -728,92 +709,6 @@ class SoundEventTests(unittest.TestCase):
                          [(0.96, 2.88, "крик"), (3.36, 4.32, "стон")])
 
 
-class AdultContentLoopTests(ProcessLoopTests):
-    def test_flagged_file_posted_as_spoiler_in_both_topics(self):
-        self.run_loop(phrases={"2": [(1.0, 2.0, "привет как дела")]}, adult={"2"})
-        main2, speech2 = "20240727_002000_tp00002.mp4", "20240727_002000_tp00002_speech.mp4"
-        self.assertTrue(self.spoilers[main2])
-        self.assertTrue(self.spoilers[speech2])
-        self.assertTrue(self.captions[main2].startswith(archive.ADULT_MARK))
-        self.assertTrue(self.captions[speech2].startswith(archive.ADULT_MARK))
-        self.assertFalse(self.spoilers["20240727_001000_tp00001.mp4"])
-        self.assertFalse(self.captions["20240727_001000_tp00001.mp4"].startswith(archive.ADULT_MARK))
-        self.assertNotIn(("mark", 1001), self.calls)
-
-    def test_old_post_without_verdict_is_checked_and_marked(self):
-        initial = {"items": {"1": {"camera": "Tapo C210", "name": "20240727_001000_tp00001.mp4", "messages": [77]}}}
-        state = self.run_loop(initial=initial, adult={"1"})
-        self.assertIn(("mark", 77), self.calls)
-        self.assertTrue(state["items"]["1"]["nsfw"])
-        self.assertNotIn(("mark", 1001), [c for c in self.calls if c[0] == "mark" and c[1] != 77])
-
-
-class NsfwUnitTests(unittest.TestCase):
-    def test_verdict_rules(self):
-        import nsfw
-        self.assertEqual(nsfw.verdict(np.array([0.1, 0.85, 0.9]))[0], True)
-        self.assertEqual(nsfw.verdict(np.array([0.1, 0.85, 0.2]))[0], False)
-        self.assertEqual(nsfw.verdict(np.array([0.92]))[0], True)
-        self.assertEqual(nsfw.verdict(np.array([0.88]))[0], False)
-        self.assertEqual(nsfw.verdict(np.zeros(0))[0], False)
-
-    def test_preprocess_and_softmax(self):
-        import nsfw
-        frames = np.zeros((3, nsfw.SIZE, nsfw.SIZE, 3), np.uint8)
-        frames[1] = 255
-        x = nsfw.preprocess(frames)
-        self.assertEqual(x.shape, (3, 3, nsfw.SIZE, nsfw.SIZE))
-        self.assertAlmostEqual(float(x[0].min()), -1.0)
-        self.assertAlmostEqual(float(x[1].max()), 1.0)
-        det = nsfw.NsfwDetector.__new__(nsfw.NsfwDetector)
-        det.input = "pixel_values"
-        det.session = mock.Mock()
-        det.session.run.side_effect = lambda _, feed: [np.tile([[0.0, 0.0]], (len(feed["pixel_values"]), 1))]
-        self.assertTrue(np.allclose(det.probabilities(frames), 0.5))
-
-    def test_sample_frames_from_video(self):
-        import nsfw
-        archive.WORK.mkdir(parents=True, exist_ok=True)
-        src = archive.WORK / "nsfw_src.mp4"
-        make_video(src, seconds=45, audio=False)
-        frames = nsfw.sample_frames(src, step=10)
-        self.assertGreaterEqual(len(frames), 4)
-        self.assertEqual(frames.shape[1:], (nsfw.SIZE, nsfw.SIZE, 3))
-        src.unlink()
-
-
-class SpoilerUploadTests(unittest.TestCase):
-    def test_spoiler_goes_through_send_media(self):
-        archive.WORK.mkdir(parents=True, exist_ok=True)
-        clip = archive.WORK / "spoiler.mp4"
-        make_video(clip, seconds=3, audio=False)
-        media = mock.Mock(spoiler=False)
-        sent = {}
-
-        class Client:
-            async def _file_to_media(self, file, **kwargs):
-                return None, media, False
-
-            async def get_input_entity(self, chat):
-                return "peer"
-
-            async def __call__(self, request):
-                sent["request"] = request
-                return "result"
-
-            def _get_response_message(self, request, result, peer):
-                return mock.Mock(id=555)
-
-        with mock.patch.object(archive, "fast_upload", mock.AsyncMock(return_value="uploaded")):
-            ids = asyncio.run(archive.upload(Client(), "chat", 201, clip, "18+ текст", [], 3.0, 320, 240,
-                                             "spoiler.mp4", spoiler=True))
-        self.assertEqual(ids, [555])
-        self.assertTrue(sent["request"].media.spoiler)
-        self.assertEqual(sent["request"].reply_to.reply_to_msg_id, 201)
-        self.assertEqual(sent["request"].message, "18+ текст")
-        clip.unlink()
-
-
 class SpeechResilienceTests(ProcessLoopTests):
     def test_speech_failure_does_not_block_main(self):
         state = self.run_loop(phrases={"3": [(1.0, 2.0, "привет как дела")]}, broken_speech={"2"})
@@ -834,6 +729,130 @@ class SpeechResilienceTests(ProcessLoopTests):
         main = [c[2] for c in self.calls if c[0] == "upload" and c[1] == 201]
         self.assertEqual(len(main), 2)
         self.assertEqual(len(state["items"]["1"]["speech"]), 1)
+
+
+class LimitAndRecoveryTests(unittest.TestCase):
+    def test_analyze_reads_mixed_layouts_in_one_file(self):
+        n = 200
+        frames = np.zeros((n, 4, 4), np.uint8)
+        frames[60:, 0, 0] = 1
+        pts = np.arange(n, dtype=float) * 2
+        big, small = (np.zeros(1), {"name": "big"}), (np.zeros(1), {"name": "small"})
+        asked = []
+
+        class FakeLayouts:
+            def get(self, sub, sub_pts, width, height, start, name):
+                asked.append(len(sub))
+                return big if len(sub) == n else small
+
+        def fake_offsets(sub, sub_pts, geom, templates, start):
+            want = 0 if geom["name"] == "big" else 1
+            return [0.0 if f[0, 0] == want else None for f in sub]
+
+        with mock.patch.object(archive, "overlay_frames", return_value=(frames, pts)), \
+                mock.patch.object(archive, "read_offsets", fake_offsets):
+            segments, events, quality, _ = archive.analyze(Path("x.mp4"), 4, 4, START, n * 2, FakeLayouts(), "x")
+        self.assertEqual(asked, [n, n - 60])
+        self.assertGreater(quality, 0.95)
+        with mock.patch.object(archive, "overlay_frames", return_value=(frames, pts)), \
+                mock.patch.object(archive, "read_offsets", fake_offsets):
+            asked.clear()
+            single = mock.Mock()
+            single.get.return_value = big
+            _, _, quality, _ = archive.analyze(Path("x.mp4"), 4, 4, START, n * 2, single, "x")
+        self.assertEqual(single.get.call_count, 2)
+        self.assertLess(quality, 0.5)
+
+    def test_tesseract_fallback_scale_and_trailing_junk(self):
+        start = datetime(2024, 10, 3, 1, 29, 32)
+        calls = []
+
+        def fake_read(img, k):
+            calls.append((k, int(img.max()), int(img.min())))
+            if len(calls) == 1:
+                return "2024-1", [(0, 0, 1, 1)] * 6
+            text = "2024-10-0301:43:507-"
+            return text, [(i, 0, i + 1, 1) for i in range(len(text))]
+
+        frame = np.full((42, 400), 150, np.uint8)
+        frame[10:20, 10:20] = 250
+        with mock.patch.object(archive, "tesseract_read", fake_read):
+            dt, chars, boxes = archive.tesseract_boxes(frame, start)
+        self.assertEqual(dt, datetime(2024, 10, 3, 1, 43, 50))
+        self.assertEqual(chars, "2024-10-0301:43:50")
+        self.assertEqual(len(boxes), 18)
+        self.assertEqual([c[0] for c in calls], [3, 3])
+        self.assertEqual(calls[1][1:], (255, 0))
+        calls.clear()
+        with mock.patch.object(archive, "tesseract_read", lambda img, k: calls.append(k) or ("", [])):
+            self.assertIsNone(archive.tesseract_boxes(np.zeros((76, 820), np.uint8), start))
+        self.assertEqual(calls, [2, 2, 3, 3])
+
+    def test_overlay_frames_reads_keyframes_and_cleans_up(self):
+        archive.WORK.mkdir(parents=True, exist_ok=True)
+        src = archive.WORK / "kf.mp4"
+        make_video(src, seconds=12, audio=False)
+        try:
+            frames, pts = archive.overlay_frames(src, 320, 240)
+            cw, ch = archive.crop_size(320, 240)
+            self.assertEqual(frames.shape, (6, ch, cw))
+            self.assertEqual(len(pts), 6)
+            self.assertEqual(list(archive.WORK.glob("*.raw")), [])
+        finally:
+            src.unlink()
+
+    def make_state(self):
+        return {"items": {
+            "1": {"camera": "Tapo C210", "name": "20240901_000000_tp1.mp4", "messages": [1], "speech": [11, 12]},
+            "2": {"camera": "Tapo C210", "name": "20240902_000000_tp2.mp4", "messages": [2], "speech": [],
+                  "speech_skipped": "MediaCaptionTooLongError"},
+            "3": {"camera": "Tapo C200", "name": "20240903_000000_tp3.mp4", "messages": [3], "speech": [31]},
+            "4": {"camera": "Tapo C210", "name": "20240904_000000_tp4.mp4", "messages": [4], "speech": [41, 42],
+                  "phrases": 3},
+            "5": {"camera": "Tapo C210", "name": "20240905_000000_tp5.mp4", "messages": [5]},
+        }, "speech_failures": {"2": 5, "3": 1}, "failures": {"4": 1}}
+
+    def run_reset(self, state, speech_only):
+        deleted = []
+
+        class Client:
+            async def delete_messages(self, chat, ids):
+                deleted.extend(ids)
+
+            async def disconnect(self):
+                pass
+
+        async def fake_connect(role):
+            assert role == "post"
+            return Client(), "chat"
+
+        with mock.patch.object(archive, "connect", fake_connect):
+            asyncio.run(archive.reset_from(state, "20240902_000000_tp2.mp4", speech_only))
+        return sorted(deleted), archive.load_json(archive.STATE_FILE, {})
+
+    def test_reset_from_main_redoes_posts_and_drops_queue_files(self):
+        archive.SPEECH_DIR.mkdir(parents=True, exist_ok=True)
+        for name in ("4.mp4", "4.json", "1.mp4"):
+            (archive.SPEECH_DIR / name).write_bytes(b"x")
+        deleted, saved = self.run_reset(self.make_state(), False)
+        self.assertEqual(deleted, [2, 4, 5, 41, 42])
+        self.assertEqual(sorted(saved["items"]), ["1", "3"])
+        self.assertEqual(saved["speech_failures"], {"3": 1})
+        self.assertEqual(saved["failures"], {})
+        self.assertEqual(sorted(p.name for p in archive.SPEECH_DIR.iterdir()), ["1.mp4"])
+        shutil.rmtree(archive.SPEECH_DIR)
+        archive.STATE_FILE.unlink()
+
+    def test_reset_from_speech_only_redoes_later_files_of_same_camera(self):
+        deleted, saved = self.run_reset(self.make_state(), True)
+        self.assertEqual(deleted, [41, 42])
+        self.assertNotIn("speech", saved["items"]["2"])
+        self.assertNotIn("speech_skipped", saved["items"]["2"])
+        self.assertNotIn("speech", saved["items"]["4"])
+        self.assertEqual(saved["items"]["1"]["speech"], [11, 12])
+        self.assertEqual(saved["items"]["3"]["speech"], [31])
+        self.assertEqual(saved["speech_failures"], {"3": 1})
+        archive.STATE_FILE.unlink()
 
 
 if __name__ == "__main__":

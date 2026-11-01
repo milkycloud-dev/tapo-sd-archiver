@@ -14,20 +14,16 @@ import threading
 import time
 from collections import Counter
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 from telethon import TelegramClient, functions
 from telethon.errors import RPCError
-from telethon.tl.functions.messages import EditMessageRequest, SendMediaRequest
 from telethon.tl.functions.upload import SaveBigFilePartRequest
-from telethon.tl.types import (
-    DocumentAttributeFilename, DocumentAttributeVideo, InputFileBig, InputMediaDocument, InputReplyToMessage,
-)
-from telethon.utils import get_input_document
+from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo, InputFileBig
 
 from backup import CAPTION_LIMIT, DATA, FFMPEG, MESSAGE_LIMIT, ROOT, fmt_duration, fmt_offset, load_env, log, run_ffmpeg
 from blacklist import mask
-from nsfw import NsfwDetector
 from sounds import SoundEvents
 from speech import Recognizer
 
@@ -48,11 +44,15 @@ ROLES = {"post": ("TG_BOT_TOKEN", "bot"), "download": ("TG_DL_BOT_TOKEN", "bot_d
 SPEECH_DIR = DATA / "speech_queue"
 RUNNING = set()
 SUBTITLE_SUFFIX = " субтитры"
-ADULT_MARK = "18+ "
 SPEECH_PAD = 2.0
 SPEECH_JOIN = 8.0
 BOX_RE = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{2}-\d{2}-\d{4})\d{2}:\d{2}:\d{2}")
 GLYPHS = "0123456789-:"
+TESS_HEIGHT = 120
+TEXT_LEVEL = 200
+CALIBRATE_FRAMES = 300
+MAX_LAYOUTS = 3
+MIN_UNREAD = 20
 OVERLAY_FORMATS = ("%Y-%m-%d%H:%M:%S", "%d-%m-%Y%H:%M:%S", "%m-%d-%Y%H:%M:%S")
 CELLS = list(range(10)) + list(range(11, 19))
 TIME_POS = [10, 11, 13, 14, 16, 17]
@@ -178,28 +178,33 @@ def crop_size(width, height):
 
 def overlay_frames(path, width, height):
     cw, ch = crop_size(width, height)
-    proc = subprocess.run(
-        [FFMPEG, "-hide_banner", "-v", "info", "-skip_frame", "nokey", "-i", str(path), "-an",
-         "-vf", f"crop={cw}:{ch}:0:0,format=gray,showinfo", "-fps_mode", "passthrough",
-         "-f", "rawvideo", "pipe:"],
-        capture_output=True,
-    )
-    frames = np.frombuffer(proc.stdout, np.uint8).reshape(-1, ch, cw)
+    raw = Path(path).with_suffix(".overlay.raw")
+    try:
+        proc = subprocess.run(
+            [FFMPEG, "-hide_banner", "-v", "info", "-y", "-skip_frame", "nokey", "-i", str(path), "-an",
+             "-vf", f"crop={cw}:{ch}:0:0,format=gray,showinfo", "-fps_mode", "passthrough",
+             "-f", "rawvideo", str(raw)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        frames = np.fromfile(raw, np.uint8) if raw.exists() else np.zeros(0, np.uint8)
+    finally:
+        raw.unlink(missing_ok=True)
+    frames = frames[:len(frames) // (ch * cw) * ch * cw].reshape(-1, ch, cw)
     pts = [float(x) for x in re.findall(rb"pts_time:([\d.]+)", proc.stderr)]
     if not len(frames) or len(pts) != len(frames):
         raise RuntimeError(f"overlay extraction failed: {len(frames)} frames, {len(pts)} pts")
     return frames, np.array(pts)
 
 
-def tesseract_boxes(frame, start):
-    big = np.repeat(np.repeat(255 - frame, 2, 0), 2, 1)
+def tesseract_read(img, k):
+    big = np.repeat(np.repeat(img, k, 0), k, 1)
     h, w = big.shape
     with tempfile.NamedTemporaryFile(suffix=".pgm", delete=False) as f:
         f.write(f"P5 {w} {h} 255\n".encode() + big.tobytes())
     try:
         proc = subprocess.run(
             ["tesseract", f.name, "-", "--psm", "7", "-c", "tessedit_char_whitelist=0123456789-:", "makebox"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, env={**os.environ, "OMP_THREAD_LIMIT": "1"},
         )
     finally:
         os.unlink(f.name)
@@ -209,11 +214,21 @@ def tesseract_boxes(frame, start):
         if len(parts) >= 5 and len(parts[0]) == 1 and parts[0] in GLYPHS:
             left, bottom, right, top = (int(v) for v in parts[1:5])
             chars += parts[0]
-            boxes.append((left / 2, (h - top) / 2, right / 2, (h - bottom) / 2))
-    if not BOX_RE.fullmatch(chars):
-        return None
-    dt = parse_overlay(chars, start)
-    return (dt, chars, boxes) if dt else None
+            boxes.append((left / k, (h - top) / k, right / k, (h - bottom) / k))
+    return chars, boxes
+
+
+def tesseract_boxes(frame, start):
+    base = max(2, round(TESS_HEIGHT / frame.shape[0]))
+    for k in (base, base + 1):
+        for img in (255 - frame, np.where(frame > TEXT_LEVEL, 0, 255).astype(np.uint8)):
+            chars, boxes = tesseract_read(img, k)
+            found = BOX_RE.match(chars)
+            if found:
+                dt = parse_overlay(found.group(), start)
+                if dt:
+                    return dt, found.group(), boxes[:found.end()]
+    return None
 
 
 def parse_overlay(text, start):
@@ -270,7 +285,7 @@ def glyph_shifts(win, geom):
 def calibrate(frames, pts, start, geom):
     gh, gw = geom["y1"] - geom["y0"], geom["gw"]
     reads = []
-    for i in range(0, len(frames), 3):
+    for i in range(0, len(frames), max(3, len(frames) // CALIBRATE_FRAMES)):
         r = tesseract_boxes(frames[i], start)
         if r:
             reads.append((i, r[1], (r[0] - start).total_seconds() - pts[i]))
@@ -359,7 +374,7 @@ def shift_scores(padded, geom, templates, dy, dx):
     return np.einsum("fpij,dij->fpd", g, templates)
 
 
-def read_digits(frames, geom, templates, batch=256, shifts=ALL_SHIFTS):
+def read_digits(frames, geom, templates, batch=64, shifts=ALL_SHIFTS):
     out = []
     for b in range(0, len(frames), batch):
         padded = pad_frames(frames[b:b + batch])
@@ -587,12 +602,22 @@ def remux(src, dst, events):
 
 def analyze(path, width, height, start, duration, layouts, name):
     frames, pts = overlay_frames(path, width, height)
-    try:
-        templates, geom = layouts.get(frames, pts, width, height, start, name)
-    except RuntimeError as exc:
-        log(f"  {name}: {exc}")
-        templates = geom = None
-    offsets = read_offsets(frames, pts, geom, templates, start) if geom else [None] * len(frames)
+    offsets, todo, used = [None] * len(frames), np.arange(len(frames)), []
+    for _ in range(MAX_LAYOUTS):
+        sub, sub_pts = (frames, pts) if len(todo) == len(frames) else (frames[todo], pts[todo])
+        try:
+            templates, geom = layouts.get(sub, sub_pts, width, height, start, name)
+        except RuntimeError as exc:
+            log(f"  {name}: {exc}")
+            break
+        if geom is None or any(g is geom for g in used):
+            break
+        used.append(geom)
+        for i, o in zip(todo, read_offsets(sub, sub_pts, geom, templates, start)):
+            offsets[i] = o
+        todo = np.array([i for i in todo if offsets[i] is None], dtype=int)
+        if len(todo) < max(MIN_UNREAD, 0.1 * len(frames)):
+            break
     segments, quality = build_segments(offsets, pts, start, duration)
     return segments, merge_events(segments), quality, [float(p) for p in pts]
 
@@ -694,7 +719,7 @@ async def fast_upload(client, path):
     return InputFileBig(file_id, total, path.name)
 
 
-async def upload(client, chat, topic, path, caption, rest, duration, width, height, name, spoiler=False):
+async def upload(client, chat, topic, path, caption, rest, duration, width, height, name):
     thumb = path.with_suffix(".jpg")
     try:
         await in_thread(run_ffmpeg, "-ss", 1, "-i", path, "-frames:v", 1, "-vf", "scale=320:-2", thumb)
@@ -705,39 +730,16 @@ async def upload(client, chat, topic, path, caption, rest, duration, width, heig
             DocumentAttributeVideo(duration=duration, w=width, h=height, supports_streaming=True),
             DocumentAttributeFilename(name),
         ]
-        if spoiler:
-            _, media, _ = await client._file_to_media(
-                uploaded, thumb=str(thumb), mime_type="video/mp4", attributes=attributes,
-                supports_streaming=True, force_document=False,
-            )
-            media.spoiler = True
-            peer = await client.get_input_entity(chat)
-            request = SendMediaRequest(peer=peer, media=media, message=caption,
-                                       reply_to=InputReplyToMessage(reply_to_msg_id=topic))
-            msg = client._get_response_message(request, await client(request), peer)
-        else:
-            msg = await client.send_file(
-                chat, uploaded, caption=caption, parse_mode=None, reply_to=topic, thumb=str(thumb),
-                supports_streaming=True, force_document=False, mime_type="video/mp4", attributes=attributes,
-            )
+        msg = await client.send_file(
+            chat, uploaded, caption=caption, parse_mode=None, reply_to=topic, thumb=str(thumb),
+            supports_streaming=True, force_document=False, mime_type="video/mp4", attributes=attributes,
+        )
     finally:
         thumb.unlink(missing_ok=True)
     ids = [msg.id]
     for text in rest:
         ids.append((await client.send_message(chat, text, reply_to=msg.id, parse_mode=None)).id)
     return ids
-
-
-async def mark_adult(client, chat, message_id):
-    msg = await client.get_messages(chat, ids=message_id)
-    if not msg or not msg.document:
-        return
-    text = msg.message or ""
-    if not text.startswith(ADULT_MARK):
-        text = ADULT_MARK + text
-    media = InputMediaDocument(id=get_input_document(msg.document), spoiler=True)
-    await client(EditMessageRequest(peer=await client.get_input_entity(chat), id=message_id, message=text, media=media))
-    log(f"  marked post {message_id} as 18+")
 
 
 def free_gb():
@@ -784,7 +786,7 @@ def extract_audio(src, dst):
     run_ffmpeg("-i", src, "-vn", "-ac", 1, "-ar", 16000, "-c:a", "libopus", "-b:a", "24k", dst)
 
 
-def prepare(item, src, layouts, nsfw):
+def prepare(item, src, layouts):
     out = WORK / f"{item['id']}.faststart.mp4"
     audio = WORK / f"{item['id']}.opus"
     try:
@@ -792,15 +794,12 @@ def prepare(item, src, layouts, nsfw):
         duration, width, height, has_audio = probe(src)
         t0 = time.monotonic()
         segments, events, quality, keyframes = analyze(src, width, height, start, duration, layouts, item["name"])
-        flagged, nsfw_top, nsfw_hits = nsfw.check(src)
         if has_audio:
             extract_audio(src, audio)
         remux(src, out, events)
         src.unlink()
-        log(f"  prepared {item['name']}: {len(events)} events, quality {quality:.3f}, "
-            f"18+ {'yes' if flagged else 'no'} (top {nsfw_top:.2f}, {nsfw_hits} frames), {time.monotonic() - t0:.0f}s")
+        log(f"  prepared {item['name']}: {len(events)} events, quality {quality:.3f}, {time.monotonic() - t0:.0f}s")
         return {
-            "nsfw": flagged, "nsfw_top": round(nsfw_top, 3),
             "start": start, "duration": duration, "width": width, "height": height, "out": out,
             "segments": segments, "events": events, "quality": quality, "keyframes": keyframes,
             "audio": audio if has_audio else None,
@@ -842,7 +841,7 @@ class Run:
         return failures[str(item["id"])] >= MAX_FAILURES and not self.args.dry_run
 
 
-async def main_stream(run, poster, post_chat, loader, load_chat, layouts, nsfw):
+async def main_stream(run, poster, post_chat, loader, load_chat, layouts):
     pending = [x for x in run.items if not run.done.get(str(x["id"]), {}).get("messages")
                and "skipped" not in run.done.get(str(x["id"]), {})]
     if run.args.limit:
@@ -862,7 +861,7 @@ async def main_stream(run, poster, post_chat, loader, load_chat, layouts, nsfw):
                 await asyncio.sleep(30)
             src = await download(loader, load_chat, item, WORK / f"{item['id']}.mp4")
         async with cpu:
-            return await in_thread(prepare, item, src, layouts, nsfw)
+            return await in_thread(prepare, item, src, layouts)
 
     def schedule(upto):
         for item in pending[:upto]:
@@ -884,8 +883,6 @@ async def main_stream(run, poster, post_chat, loader, load_chat, layouts, nsfw):
                 run.save()
                 continue
             caption, rest = build_caption(r["start"], r["duration"], r["events"])
-            if r["nsfw"]:
-                caption = ADULT_MARK + caption
             log(f"[{n + 1}/{len(pending)}] {item['camera']} {item['name']}")
             try:
                 if run.args.dry_run:
@@ -896,11 +893,10 @@ async def main_stream(run, poster, post_chat, loader, load_chat, layouts, nsfw):
                 else:
                     topic = await ensure_topic(poster, post_chat, run.state, item["camera"])
                     ids = await upload(poster, post_chat, topic, r["out"], caption, rest, r["duration"],
-                                       r["width"], r["height"], item["name"], spoiler=r["nsfw"])
+                                       r["width"], r["height"], item["name"])
                 entry = run.done[key] = {
                     "camera": item["camera"], "name": item["name"], "messages": ids,
-                    "events": len(r["events"]), "quality": round(r["quality"], 3), "nsfw": r["nsfw"],
-                    "nsfw_top": r["nsfw_top"],
+                    "events": len(r["events"]), "quality": round(r["quality"], 3),
                     "posted": datetime.now().isoformat(timespec="seconds"),
                 }
                 if r["audio"]:
@@ -929,7 +925,7 @@ def speech_meta(r, message):
     return {
         "start": r["start"].isoformat(), "duration": r["duration"], "width": r["width"], "height": r["height"],
         "segments": dump_timeline(r["segments"]), "events": dump_timeline(r["events"]),
-        "keyframes": r["keyframes"], "message": message, "nsfw": r.get("nsfw", False),
+        "keyframes": r["keyframes"], "message": message,
     }
 
 
@@ -945,8 +941,7 @@ def rebuild_speech_input(item, src, layouts, audio, meta_path, message):
     return has_audio
 
 
-async def speech_item(run, item, entry, poster, post_chat, loader, load_chat, recognizer, detector, layouts, nsfw,
-                      work):
+async def speech_item(run, item, entry, poster, post_chat, loader, load_chat, recognizer, detector, layouts, work):
     key = str(item["id"])
     audio, meta_path, video = speech_files(run, key)
     src, clip = work / f"{key}.mp4", work / f"{key}.speech.mp4"
@@ -961,14 +956,7 @@ async def speech_item(run, item, entry, poster, post_chat, loader, load_chat, re
                 run.save()
                 meta_path.unlink(missing_ok=True)
                 return
-        if "nsfw" not in entry:
-            target = video if video.exists() else await download(loader, load_chat, item, src)
-            flagged, top, _ = await in_thread(nsfw.check, target)
-            entry["nsfw"], entry["nsfw_top"] = flagged, round(top, 3)
-            if flagged and not run.args.dry_run:
-                await mark_adult(poster, post_chat, entry["messages"][0])
-            run.save()
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta =json.loads(meta_path.read_text(encoding="utf-8"))
         t0 = time.monotonic()
         spoken = [(a, b, mask(text)) for a, b, text in await in_thread(recognizer.transcribe, audio)]
         sounds = await in_thread(detector.detect, audio)
@@ -985,9 +973,6 @@ async def speech_item(run, item, entry, poster, post_chat, loader, load_chat, re
             clip_len = sum(lengths)
             caption, rest = build_speech_caption(start, duration, events, segments, phrases, spans, lengths,
                                                  clip_len, message_link(meta["message"]))
-            adult = bool(meta.get("nsfw") or entry.get("nsfw"))
-            if adult:
-                caption = ADULT_MARK + caption
             if run.args.dry_run:
                 print("=== speech ===\n" + caption)
                 for text in rest:
@@ -995,8 +980,7 @@ async def speech_item(run, item, entry, poster, post_chat, loader, load_chat, re
             else:
                 topic = await ensure_topic(poster, post_chat, run.state, item["camera"] + SUBTITLE_SUFFIX)
                 speech_ids = await upload(poster, post_chat, topic, clip, caption, rest, clip_len,
-                                          meta["width"], meta["height"], item["name"].replace(".mp4", "_speech.mp4"),
-                                          spoiler=adult)
+                                          meta["width"], meta["height"], item["name"].replace(".mp4", "_speech.mp4"))
         entry["speech"] = speech_ids
         entry["phrases"] = len(spoken)
         entry["sounds"] = len(sounds)
@@ -1008,7 +992,7 @@ async def speech_item(run, item, entry, poster, post_chat, loader, load_chat, re
         clip.unlink(missing_ok=True)
 
 
-async def speech_stream(run, poster, post_chat, loader, load_chat, recognizer, detector, layouts, nsfw):
+async def speech_stream(run, poster, post_chat, loader, load_chat, recognizer, detector, layouts):
     work = WORK / "speech"
     work.mkdir(parents=True, exist_ok=True)
     for item in run.items:
@@ -1025,7 +1009,7 @@ async def speech_stream(run, poster, post_chat, loader, load_chat, recognizer, d
         while True:
             try:
                 await speech_item(run, item, entry, poster, post_chat, loader, load_chat, recognizer, detector, layouts,
-                                  nsfw, work)
+                                  work)
                 break
             except Exception as exc:
                 failures = run.state.setdefault("speech_failures", {})
@@ -1063,11 +1047,9 @@ async def cmd_process(args):
         layouts = Layouts(TEMPLATES_FILE)
         recognizer = await asyncio.to_thread(Recognizer, ASR_THREADS)
         detector = await asyncio.to_thread(SoundEvents, 1)
-        nsfw = await asyncio.to_thread(NsfwDetector, 1)
         async with asyncio.TaskGroup() as group:
-            group.create_task(main_stream(run, poster, post_chat, loader, load_chat, layouts, nsfw))
-            group.create_task(speech_stream(run, poster, post_chat, loader, load_chat, recognizer, detector, layouts,
-                                            nsfw))
+            group.create_task(main_stream(run, poster, post_chat, loader, load_chat, layouts))
+            group.create_task(speech_stream(run, poster, post_chat, loader, load_chat, recognizer, detector, layouts))
     finally:
         await drain_threads()
         await poster.disconnect()
@@ -1076,10 +1058,42 @@ async def cmd_process(args):
         log(f"work dir cleared, free {free_gb():.1f} GB, speech queue {dir_gb(SPEECH_DIR):.2f} GB")
 
 
+async def reset_from(state, name, speech_only):
+    items = state.get("items", {})
+    target = next((e for e in items.values() if e["name"] == name), None)
+    if target is None:
+        sys.exit(f"{name} is not in the archive state")
+    chosen = {k: e for k, e in items.items() if e["camera"] == target["camera"] and e["name"] >= name
+              and ("speech" in e or not speech_only)}
+    ids = [m for e in chosen.values() for m in (e.get("speech") or []) + ([] if speech_only else e.get("messages") or [])]
+    poster, chat = await connect("post")
+    try:
+        for i in range(0, len(ids), 100):
+            await poster.delete_messages(chat, ids[i:i + 100])
+    finally:
+        await poster.disconnect()
+    for key, entry in chosen.items():
+        state.get("speech_failures", {}).pop(key, None)
+        if speech_only:
+            for field in ("speech", "phrases", "sounds", "speech_skipped"):
+                entry.pop(field, None)
+            continue
+        state.get("failures", {}).pop(key, None)
+        items.pop(key)
+        for path in SPEECH_DIR.glob(f"{key}.*"):
+            path.unlink()
+    save_json(STATE_FILE, state)
+    log(f"reset: {len(ids)} {'speech ' if speech_only else ''}posts of {len(chosen)} {target['camera']} files "
+        f"from {name} deleted, they will be redone in order")
+
+
 async def cmd_reset(args):
     if not args.yes:
         sys.exit("reset deletes every post of the posting bot in the archive topics; pass --yes")
     state = load_json(STATE_FILE, {})
+    if args.start:
+        await reset_from(state, args.start, args.speech_only)
+        return
     names = {**TOPICS, **state.get("topics", {})}
     topics = {t for name, t in names.items() if not args.speech_only or name.endswith(SUBTITLE_SUFFIX)}
     poster, chat = await connect("post")
@@ -1133,6 +1147,7 @@ def main():
     reset = sub.add_parser("reset")
     reset.add_argument("--yes", action="store_true")
     reset.add_argument("--speech-only", action="store_true")
+    reset.add_argument("--from", dest="start", default="")
     args = parser.parse_args()
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     load_env(DATA / ".env")
