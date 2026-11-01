@@ -1,0 +1,54 @@
+name: tapo
+
+volumes:
+  tapo-data:
+    name: tapo-data
+
+networks:
+  tapo-net:
+    name: tapo-net
+
+services:
+  tapo:
+    build: .
+    image: tapo:latest
+    container_name: tapo
+    restart: "no"
+    env_file: ./secrets/tapo.env
+    volumes:
+      - tapo-data:/data
+    networks: [tapo-net]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 2000m
+    memswap_limit: 2000m
+    cpus: 3.0
+    cpu_shares: 128
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  archive:
+    image: tapo:latest
+    container_name: tapo-archive
+    command: ["archive.py", "process"]
+    restart: on-failure
+    env_file: ./secrets/tapo.env
+    volumes:
+      - tapo-data:/data
+    networks: [tapo-net]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 2000m
+    memswap_limit: 2000m
+    cpus: 3.0
+    cpu_shares: 128
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
+    profiles: ["archive"]

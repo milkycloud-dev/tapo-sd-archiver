@@ -1,0 +1,11 @@
+.env
+logs-agent/
+.venv/
+recordings/
+*.session
+__pycache__/
+.tapo_session.json
+work/
+state.json
+state.tmp
+secrets/
