@@ -36,6 +36,10 @@ services:
     command: ["archive.py", "process"]
     restart: on-failure
     env_file: ./secrets/tapo.env
+    environment:
+      MIN_FREE_GB: "4"
+      ARCHIVE_WORKERS: "1"
+      TAPO_LOG_SOURCE: archive
     volumes:
       - tapo-data:/data
     networks: [tapo-net]
@@ -52,3 +56,58 @@ services:
       driver: json-file
       options: {max-size: "20m", max-file: "5"}
     profiles: ["archive"]
+
+  live:
+    image: tapo:latest
+    container_name: tapo-live
+    command: ["live.py"]
+    restart: unless-stopped
+    env_file: ./secrets/tapo.env
+    environment:
+      TAPO_LOG_SOURCE: live
+    volumes:
+      - tapo-data:/data
+    networks: [tapo-net]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 2000m
+    memswap_limit: 2000m
+    cpus: 3.0
+    cpu_shares: 128
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
+    profiles: ["live"]
+
+  panel:
+    image: tapo:latest
+    container_name: tapo-panel
+    command: ["panel.py"]
+    restart: always
+    env_file: ./secrets/tapo.env
+    environment:
+      TAPO_LOG_SOURCE: panel
+    volumes:
+      - tapo-data:/data
+    networks: [tapo-net]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: 0.5
+    cpu_shares: 256
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/data/panel_heartbeat')<300 else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "3"}
+    profiles: ["panel"]

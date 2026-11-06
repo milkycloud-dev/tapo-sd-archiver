@@ -732,6 +732,56 @@ class SpeechResilienceTests(ProcessLoopTests):
 
 
 class LimitAndRecoveryTests(unittest.TestCase):
+    def test_widest_known_font_fits_crop_and_overflow_is_rejected(self):
+        cw, ch = archive.crop_size(2304, 1296)
+        geom = {"xs": [6 + 44 * c for c in archive.CELLS], "gw": 28, "y0": 4, "y1": 50}
+        frames = np.zeros((2, ch, cw), np.uint8)
+        templates = np.ones((10, geom["y1"] - geom["y0"], geom["gw"]), np.float32)
+        self.assertEqual(archive.read_digits(frames, geom, templates).shape, (2, len(archive.CELLS)))
+        start = datetime(2024, 1, 1)
+        text = "2024-01-0100:00:00"
+
+        def reads(pitch, y1=30):
+            boxes = [(4 + pitch * c, 4, 4 + pitch * c + 20, y1) for c in archive.CELLS]
+            return mock.patch.object(archive, "tesseract_boxes", return_value=(start, text, boxes))
+
+        small = np.zeros((5, 60, 400), np.uint8)
+        with reads(10):
+            self.assertIsNotNone(archive.detect_layout(small, 800, 1000, start))
+        with reads(30):
+            self.assertIsNone(archive.detect_layout(small, 800, 1000, start))
+        with reads(10, y1=70):
+            self.assertIsNone(archive.detect_layout(small, 800, 1000, start))
+
+    def test_frame_subset_reads_only_requested_frames(self):
+        frames = np.arange(40, dtype=np.uint8).reshape(10, 2, 2)
+        subset = archive.FrameSubset(frames, np.array([1, 3, 5, 7, 9]))
+        self.assertEqual(len(subset), 5)
+        self.assertEqual(subset.shape, (5, 2, 2))
+        self.assertTrue((subset[1] == frames[3]).all())
+        self.assertTrue((subset[1:3] == frames[[3, 5]]).all())
+        self.assertTrue((subset[::2] == frames[[1, 5, 9]]).all())
+        self.assertEqual(len(list(subset)), 5)
+
+    def test_memory_gate_waits_then_gives_up(self):
+        tmp = Path(tempfile.mkdtemp(prefix="tapo-mem-"))
+        try:
+            (tmp / "max").write_text("1000\n")
+            (tmp / "stat").write_text("file 5\nanon 900\nkernel 1\n")
+            with mock.patch.object(archive, "MEMORY_MAX_FILE", tmp / "max"), \
+                    mock.patch.object(archive, "MEMORY_STAT_FILE", tmp / "stat"), \
+                    mock.patch.object(archive, "MEMORY_WAIT", 0):
+                self.assertEqual(archive.memory_share(), 0.9)
+                asyncio.run(archive.wait_for_memory("x"))
+            (tmp / "max").write_text("max\n")
+            with mock.patch.object(archive, "MEMORY_MAX_FILE", tmp / "max"), \
+                    mock.patch.object(archive, "MEMORY_STAT_FILE", tmp / "stat"):
+                self.assertEqual(archive.memory_share(), 0.0)
+            with mock.patch.object(archive, "MEMORY_MAX_FILE", tmp / "absent"):
+                self.assertEqual(archive.memory_share(), 0.0)
+        finally:
+            shutil.rmtree(tmp)
+
     def test_analyze_reads_mixed_layouts_in_one_file(self):
         n = 200
         frames = np.zeros((n, 4, 4), np.uint8)

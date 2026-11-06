@@ -16,6 +16,8 @@ import imageio_ffmpeg
 from ontapo import OnTapo, OnTapoError, Unauthorized
 from ontapo.tsdemux import extract_g711_audio
 
+import control
+
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("TAPO_DATA") or ROOT)
 SESSION_FILE = DATA / ".tapo_session.json"
@@ -30,8 +32,16 @@ MESSAGE_LIMIT = 4000
 DAY_ATTEMPTS = 3
 
 
+class LoginRequired(Exception):
+    pass
+
+
 def log(msg):
-    print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}", flush=True)
+    line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
+    print(line, flush=True)
+    source = os.environ.get("TAPO_LOG_SOURCE")
+    if source:
+        control.append_log(source, line)
 
 
 def load_env(path):
@@ -46,11 +56,33 @@ def load_env(path):
 
 
 def save_session(s):
-    SESSION_FILE.write_text(json.dumps(s.to_dict()), encoding="utf-8")
+    control.write_json(SESSION_FILE, s.to_dict(), mode=0o600)
+
+
+async def open_saved_session():
+    saved = control.read_json(SESSION_FILE, None)
+    if not saved or not saved.get("token"):
+        raise LoginRequired("no saved session")
+    s = OnTapo.from_dict(saved)
     try:
-        os.chmod(SESSION_FILE, 0o600)
-    except OSError:
+        await s.cameras()
+        return s
+    except OnTapoError:
         pass
+    try:
+        with control.session_lock():
+            current = control.read_json(SESSION_FILE, saved)
+            if current.get("refreshToken") != s.refresh_token:
+                await s.aclose()
+                s = OnTapo.from_dict(current)
+            else:
+                await s.refresh()
+                save_session(s)
+        await s.cameras()
+        return s
+    except OnTapoError as exc:
+        await s.aclose()
+        raise LoginRequired(type(exc).__name__) from None
 
 
 async def open_session():
@@ -67,8 +99,7 @@ async def open_session():
                 return s
             except OnTapoError:
                 await s.aclose()
-    email = os.environ.get("TAPO_EMAIL")
-    password = os.environ.get("TAPO_PASSWORD")
+    email, password = control.load_credentials()
     if not email or not password:
         sys.exit("Tapo session expired and TAPO_EMAIL / TAPO_PASSWORD missing in .env")
     s = await OnTapo.login(email, password, mfa=lambda: input("MFA code from email: ").strip())
@@ -373,8 +404,9 @@ async def fetch_clip(s, dev, clip, path):
                 part.replace(path)
                 return True
         except Unauthorized:
-            await s.refresh()
-            save_session(s)
+            with control.session_lock():
+                await s.refresh()
+                save_session(s)
         except Exception as exc:
             log(f"  {dev.name} {clip.start:%H:%M:%S}: {type(exc).__name__}: {exc}")
         await asyncio.sleep(10 * (attempt + 1))

@@ -22,6 +22,18 @@ Tapo cameras record to a microSD card that fills up, and the only remote access 
 - **`backup.py`**: logs in to the Tapo cloud (with e-mail MFA on first run), lists SD recordings, downloads them through the cloud relay, converts them to MP4 (H.264 copy or HEVC, G.711 audio to AAC) and posts one daily compilation per camera with chapters and clickable timecodes.
 - **`archive.py`**: takes an existing archive of raw SD files that was already posted to Telegram and republishes it cleanly: one topic per camera, strictly chronological, each video remuxed for instant playback, with a caption of recognized camera times.
 - **Speech stream**: a second, independent stream posts speech clips with transcripts into a separate topic per camera.
+- **`live.py`**: after the archive, pulls new recordings from the Tapo cloud: one compilation per completed camera day into the same topics, split only above 2 GB, with the same captions and speech stream. Days go out strictly in order: a day that fails blocks later days of that camera until it succeeds.
+
+- **`panel.py`**: a Discord panel for keeping the Tapo login valid and running the live pull: login with the e-mail code, status per camera and SD card, pause, restart, settings and logs.
+
+### Panel
+
+The panel creates a private category in the guild from `PANEL_GUILD_ID`: `панель` holds one status message with buttons, `журнал` holds the actions and important log lines. Only the guild owner and `PANEL_ADMIN_IDS` can use it.
+
+- The live pull never logs in by itself: it would risk an account lock and could not answer the e-mail code. When the session is dead it waits and the panel pings the owner.
+- **Войти** logs in and asks Tapo for a code when the account needs one, **Ввести код** finishes it. The new session is picked up right away.
+- The session is checked every 30 minutes and refreshed once a day.
+- Text typed into a Discord modal passes through Discord and is not masked on screen. Credentials are stored with mode 0600 and are never written to logs.
 
 ### How the archive works
 
@@ -84,7 +96,9 @@ python archive.py process --dry-run --limit 3
 python archive.py reset --yes --speech-only   # delete speech posts and redo them
 python archive.py reset --yes --from 20241002_230019_tp00168.mp4   # redo one camera's posts from this file on, in order
 python archive.py reset --yes --speech-only --from 20240928_213340_tp00135.mp4   # same for speech posts only
-python backup.py run              # daily cloud backup loop
+python live.py                    # live pull into the archive topics, checks hourly
+python live.py --dry-run --camera C200 --date 20260812   # build one day and print its caption, nothing is posted
+python backup.py run              # standalone daily cloud backup loop
 python backup.py day --camera C200 --date 20261028 --no-upload
 ```
 
@@ -111,6 +125,8 @@ Captions, transcripts and topic names are Russian on purpose: the cameras and th
 - **`backup.py`**: входит в облако Tapo (при первом запуске код из почты), получает список записей с карты, скачивает их через облачный relay, переводит в MP4 (H.264 без перекодирования или HEVC, звук G.711 в AAC) и публикует одну дневную подборку на камеру с главами и кликабельными таймкодами.
 - **`archive.py`**: берёт уже выложенный в Telegram архив сырых файлов с карты и публикует его заново и аккуратно: своя тема на камеру, строго по хронологии, каждое видео пересобрано для мгновенного воспроизведения, в подписи распознанное время камеры.
 - **Поток речи**: второй, независимый поток выкладывает фрагменты с речью и расшифровкой в отдельную тему для каждой камеры.
+- **`panel.py`**: панель в Discord, чтобы вход в Tapo всегда был действующим и живой поток был под рукой: вход с кодом с почты, состояние камер и карт памяти, пауза, перезапуск, настройки и журналы. Живой поток сам не входит, при мёртвой сессии ждёт, а панель зовёт владельца.
+- **`live.py`**: после архива забирает новые записи из облака Tapo: одна подборка за завершённый день камеры в те же темы, деление только свыше 2 ГБ, те же подписи и поток речи. Дни идут строго по порядку: день с ошибкой задерживает следующие дни этой камеры, пока не будет выложен.
 
 ### Как работает архив
 

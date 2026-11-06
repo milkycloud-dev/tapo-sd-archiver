@@ -51,6 +51,10 @@ GLYPHS = "0123456789-:"
 TESS_HEIGHT = 120
 TEXT_LEVEL = 200
 CALIBRATE_FRAMES = 300
+MEMORY_GATE = float(os.environ.get("MEMORY_GATE", "0.6") or 0.6)
+MEMORY_WAIT = 600
+MEMORY_MAX_FILE = Path("/sys/fs/cgroup/memory.max")
+MEMORY_STAT_FILE = Path("/sys/fs/cgroup/memory.stat")
 MAX_LAYOUTS = 3
 MIN_UNREAD = 20
 OVERLAY_FORMATS = ("%Y-%m-%d%H:%M:%S", "%d-%m-%Y%H:%M:%S", "%m-%d-%Y%H:%M:%S")
@@ -173,7 +177,19 @@ def norm(g):
 
 
 def crop_size(width, height):
-    return min(width, 820) // 2 * 2, int(height * 0.06) // 2 * 2
+    return min(width, 960) // 2 * 2, int(height * 0.06) // 2 * 2
+
+
+class FrameSubset:
+    def __init__(self, frames, index):
+        self.frames, self.index = frames, index
+        self.shape = (len(index), *frames.shape[1:])
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, key):
+        return np.asarray(self.frames[self.index[key]])
 
 
 def overlay_frames(path, width, height):
@@ -186,9 +202,14 @@ def overlay_frames(path, width, height):
              "-f", "rawvideo", str(raw)],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
-        frames = np.fromfile(raw, np.uint8) if raw.exists() else np.zeros(0, np.uint8)
+        frames = np.zeros(0, np.uint8)
+        if raw.exists() and raw.stat().st_size:
+            frames = np.memmap(raw, np.uint8, mode="r")
     finally:
-        raw.unlink(missing_ok=True)
+        try:
+            raw.unlink(missing_ok=True)
+        except OSError:
+            pass
     frames = frames[:len(frames) // (ch * cw) * ch * cw].reshape(-1, ch, cw)
     pts = [float(x) for x in re.findall(rb"pts_time:([\d.]+)", proc.stderr)]
     if not len(frames) or len(pts) != len(frames):
@@ -263,7 +284,9 @@ def detect_layout(frames, width, height, start, picks=40):
     gw = int(np.median(widths)) + 2
     y0, y1 = max(int(np.median(tops)) - 1, 0), int(np.ceil(np.median(bottoms))) + 1
     xs = [int(round(x0 + pitch * c - gw / 2)) for c in CELLS]
-    signature = f"v2_{width}x{height}_p{pitch:.0f}_h{(y1 - y0) // 2 * 2}"
+    if min(xs) < 0 or xs[-1] + gw > frames.shape[2] or y1 > frames.shape[1]:
+        return None
+    signature =f"v2_{width}x{height}_p{pitch:.0f}_h{(y1 - y0) // 2 * 2}"
     return signature, {"xs": xs, "gw": gw, "y0": y0, "y1": y1}
 
 
@@ -500,10 +523,10 @@ def cam_label(moment, first):
     return f"{moment:%H:%M:%S}" if moment.date() == first.date() else f"{moment:%d.%m %H:%M:%S}"
 
 
-def build_caption(start, duration, events):
+def build_caption(start, duration, events, note=""):
     first, span = time_span(start, duration, events)
     n = len(events)
-    header = f"{span}\n{fmt_duration(duration)} видео {n} {plural(n, 'событие', 'события', 'событий')}"
+    header = f"{span}\n{fmt_duration(duration)} видео {n} {plural(n, 'событие', 'события', 'событий')}{note}"
     header += "\nвремя в ролике - время камеры:"
     lines = [f"{fmt_offset(e['pos'])} - {cam_label(e['cam'], first)}" for e in events]
     return split_text(header, lines)
@@ -604,7 +627,7 @@ def analyze(path, width, height, start, duration, layouts, name):
     frames, pts = overlay_frames(path, width, height)
     offsets, todo, used = [None] * len(frames), np.arange(len(frames)), []
     for _ in range(MAX_LAYOUTS):
-        sub, sub_pts = (frames, pts) if len(todo) == len(frames) else (frames[todo], pts[todo])
+        sub, sub_pts = (frames, pts) if len(todo) == len(frames) else (FrameSubset(frames, todo), pts[todo])
         try:
             templates, geom = layouts.get(sub, sub_pts, width, height, start, name)
         except RuntimeError as exc:
@@ -768,6 +791,25 @@ async def drain_threads(timeout=50):
         await asyncio.wait(set(RUNNING), timeout=timeout)
 
 
+def memory_share():
+    try:
+        limit = int(MEMORY_MAX_FILE.read_text())
+        stat = MEMORY_STAT_FILE.read_text()
+        return int(re.search(r"^anon (\d+)", stat, re.M)[1]) / limit
+    except (OSError, ValueError, TypeError):
+        return 0.0
+
+
+async def wait_for_memory(name):
+    deadline = time.monotonic() + MEMORY_WAIT
+    warned = False
+    while memory_share() >= MEMORY_GATE and time.monotonic() < deadline:
+        if not warned:
+            log(f"  {name}: waiting for memory, {memory_share():.0%} of the limit in use")
+            warned = True
+        await asyncio.sleep(5)
+
+
 def dir_gb(path):
     return sum(p.stat().st_size for p in path.glob("*") if p.is_file()) / 1e9 if path.exists() else 0.0
 
@@ -861,6 +903,7 @@ async def main_stream(run, poster, post_chat, loader, load_chat, layouts):
                 await asyncio.sleep(30)
             src = await download(loader, load_chat, item, WORK / f"{item['id']}.mp4")
         async with cpu:
+            await wait_for_memory(item["name"])
             return await in_thread(prepare, item, src, layouts)
 
     def schedule(upto):
@@ -956,7 +999,8 @@ async def speech_item(run, item, entry, poster, post_chat, loader, load_chat, re
                 run.save()
                 meta_path.unlink(missing_ok=True)
                 return
-        meta =json.loads(meta_path.read_text(encoding="utf-8"))
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        await wait_for_memory(item["name"])
         t0 = time.monotonic()
         spoken = [(a, b, mask(text)) for a, b, text in await in_thread(recognizer.transcribe, audio)]
         sounds = await in_thread(detector.detect, audio)

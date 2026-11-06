@@ -13,3 +13,4 @@ rsa==4.9.1
 numpy==2.2.6
 onnx-asr==0.12.0
 onnxruntime==1.23.2
+discord.py==2.7.1

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.0
+
+- Live pull (`live.py`): one compilation per completed camera day from the Tapo cloud into the archive topics, split above 2 GB, strict day order, independent speech stream, resume after a restart without repeating posted parts.
+- Discord panel (`panel.py`): login with the e-mail code, session checks and daily refresh, camera and SD card status, pause, restart, settings, logs and a journal.
+- The live pull waits for a valid session instead of attempting a login by itself.
+- Peak memory protection: memory mapped keyframe crops, one OCR worker, a memory gate before heavy stages, large buffers returned to the OS.
+- Wider overlay crop: the largest font no longer crashes files, and layouts that do not fit the crop are rejected.
+
 ## 1.1.0
 
 - Overlay recognition: tesseract upscale follows the crop height with one larger retry, a binarized pass, trailing scene text ignored; files whose overlay font changes midway are read with several layouts. 1280x720 files are now read.
