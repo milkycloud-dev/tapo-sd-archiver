@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -20,6 +21,7 @@ import control  # noqa: E402
 import live  # noqa: E402
 import panel  # noqa: E402
 from ontapo.errors import AuthError, MFARequired  # noqa: E402
+from ontapo.models import SDCard  # noqa: E402
 
 
 class FakeSession:
@@ -263,6 +265,35 @@ class RenderTests(Base):
         self.assertIn("работает", fields["Живой поток"])
         for piece in ("Постов 119", "Субтитры ждут: 3", "12.08.2026", "13.08.2026, клипы 3/10", "Дней осталось: 80", "normal 29 GB"):
             self.assertIn(piece, fields["Tapo C200"])
+
+    def test_card_lines_match_device_and_read_loop_from_config(self):
+        now = datetime(2026, 11, 12, 12, tzinfo=timezone.utc).timestamp()
+        since = datetime(2026, 8, 12, 12, tzinfo=timezone.utc).timestamp()
+        card = {"state": "normal", "total": 59055800320, "free": 14565005084, "loop": True, "since": since}
+        text = "\n".join(panel.card_lines(card, now))
+        for piece in ("Карта 55.0 ГБ: занято 41.4 ГБ (75%), свободно 13.6 ГБ", "Циклическая запись: вкл",
+                      "Запись с 12.08.2026", "дальше перезапись старых"):
+            self.assertIn(piece, text)
+        self.assertNotIn("⚠️", text)
+        off = "\n".join(panel.card_lines({**card, "loop": False}, now))
+        self.assertIn("⚠️ выкл", off)
+        self.assertIn("запись остановится", off)
+        self.assertEqual(panel.card_lines({**card, "state": "offline"}, now), ["⚠️ Карта: не найдена"])
+        self.assertEqual(panel.card_lines("нет ответа: TimeoutError", now), ["Карта: нет ответа: TimeoutError"])
+
+    def test_card_info_uses_circular_config_not_runtime_flag(self):
+        sd = SDCard.from_hd_info({"detect_status": "normal", "total_space_accurate": "100B", "free_space_accurate": "40B",
+                                  "loop_record_status": "0", "record_start_time": "1786528251"})
+
+        class Device:
+            async def sd_card_status(self):
+                return sd
+
+            async def get_circular_recording(self):
+                return {"harddisk_manage": {"harddisk": {"loop": "on"}}}
+
+        info = asyncio.run(panel.card_info(Device()))
+        self.assertEqual(info, {"state": "normal", "total": 100, "free": 40, "loop": True, "since": 1786528251})
 
     def test_login_required_is_red_and_code_prompt_wins(self):
         embed, needed = panel.render(self.snap(), {"valid": False, "checked": time.time()}, False)

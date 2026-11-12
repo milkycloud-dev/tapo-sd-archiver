@@ -99,16 +99,56 @@ async def probe_session():
     except Exception as exc:
         return {**result, "valid": None, "error": type(exc).__name__}
     async with s:
-        cams = await s.cameras()
+        try:
+            cams = await s.cameras()
+        except Exception as exc:
+            return {**result, "valid": None, "error": type(exc).__name__}
         for cam in cams:
             s.app_server = cam.app_server or s.app_server
             info = {"name": cam.name}
             try:
-                info["sd"] = (await s.device(cam.device_id, name=cam.name).sd_card_status()).summary[:120]
+                info["sd"] = await card_info(s.device(cam.device_id, name=cam.name))
             except Exception as exc:
                 info["sd"] = f"нет ответа: {type(exc).__name__}"
             result["cameras"].append(info)
     return {**result, "valid": True}
+
+
+async def card_info(device):
+    sd = await device.sd_card_status()
+    try:
+        config = await device.get_circular_recording()
+        loop = {"on": True, "off": False}.get(config.get("harddisk_manage", {}).get("harddisk", {}).get("loop"))
+    except Exception:
+        loop = None
+    since = sd.recording_since.timestamp() if sd.recording_since else 0
+    return {"state": sd.state, "total": sd.total_bytes, "free": sd.free_bytes, "loop": loop, "since": since}
+
+
+def gib(n):
+    return n / 1024 ** 3
+
+
+def card_lines(card, now):
+    if isinstance(card, str):
+        return [f"Карта: {card}"]
+    if card["state"] in ("", "offline"):
+        return ["⚠️ Карта: не найдена"]
+    if not card["total"]:
+        return [f"⚠️ Карта: {card['state']}"]
+    used = max(card["total"] - card["free"], 0)
+    lines = [] if card["state"] == "normal" else [f"⚠️ Карта: {card['state']}"]
+    lines.append(f"Карта {gib(card['total']):.1f} ГБ: занято {gib(used):.1f} ГБ ({used / card['total']:.0%}), "
+                 f"свободно {gib(card['free']):.1f} ГБ")
+    lines.append("Циклическая запись: " + {True: "вкл", False: "⚠️ выкл", None: "не удалось узнать"}[card["loop"]])
+    if card["since"]:
+        lines.append(f"Запись с {datetime.fromtimestamp(card['since']):%d.%m.%Y}")
+        rate = used / max(now - card["since"], 86400)
+        if rate > 0 and card["free"] > 0:
+            full = datetime.fromtimestamp(now + card["free"] / rate)
+            after = "дальше перезапись старых" if card["loop"] is not False else "дальше запись остановится"
+            lines.append(f"Заполнится ~{full:%d.%m.%Y}, {after}")
+    return lines
 
 
 async def keep_alive():
@@ -216,7 +256,7 @@ def render(snap, probe, waiting_code):
         if live.get("error"):
             lines.append(f"⚠️ {live['error'][:120]}")
         if sd_cards.get(name):
-            lines.append(f"Карта: {sd_cards[name]}")
+            lines += card_lines(sd_cards[name], snap["now"])
         embed.add_field(name=name, value="\n".join(lines), inline=True)
     embed.add_field(name="Диск и настройки", inline=False, value=(
         f"Свободно {snap['free_gb']:.1f} ГБ, очередь {snap['queue_gb']:.1f} ГБ\n"
