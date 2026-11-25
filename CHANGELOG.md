@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.0 (2026-11-25)
+
+- Optional remote speech worker: with `SPEECH_URL` and `SPEECH_KEY` set, transcription and sound events come from an HTTP worker and no models are loaded in the container. `SPEECH_LANGUAGE` picks the language.
+
 ## 1.2.0
 
 - Live pull (`live.py`): one compilation per completed camera day from the Tapo cloud into the archive topics, split above 2 GB, strict day order, independent speech stream, resume after a restart without repeating posted parts.

@@ -24,8 +24,12 @@ from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo,
 
 from backup import CAPTION_LIMIT, DATA, FFMPEG, MESSAGE_LIMIT, ROOT, fmt_duration, fmt_offset, load_env, log, run_ffmpeg
 from blacklist import mask
-from sounds import SoundEvents
-from speech import Recognizer
+
+if os.environ.get("SPEECH_URL"):
+    from remote import Recognizer, SoundEvents
+else:
+    from sounds import SoundEvents
+    from speech import Recognizer
 
 def env_pairs(name):
     return [tuple(x.strip() for x in part.split("=", 1)) for part in os.environ.get(name, "").split(",") if "=" in part]

@@ -50,6 +50,8 @@ The panel creates a private category in the guild from `PANEL_GUILD_ID`: `пан
 
 Ordering is strict in every topic: files are prepared in parallel, but a post is sent only after every earlier post of that topic.
 
+Recognition can also run on another machine. With `SPEECH_URL` (and `SPEECH_KEY`) set, the speech stream loads no models: it uploads each queued `.opus` file to a speech worker (`POST /v1/jobs`, header `X-Client-Key`, then `GET /v1/jobs/<id>` until `done` and `POST /v1/jobs/<id>/ack`) and takes the phrases and sound events from the answer. The blacklist and the clips stay local. `SPEECH_LANGUAGE` (default `ru`, `auto` for detection) is passed to the worker. Without `SPEECH_URL` everything runs in the container as before.
+
 ### Safety and resources
 
 - No ids, tokens or addresses in the code: everything comes from `.env`.
@@ -142,6 +144,8 @@ Captions, transcripts and topic names are Russian on purpose: the cameras and th
    - из видео в очереди вырезаются моменты с речью и публикуются с расшифровкой.
 
 Порядок строгий в каждой теме: файлы готовятся параллельно, но пост уходит только после всех более ранних постов этой темы.
+
+Распознавание можно вынести на другую машину. Если заданы `SPEECH_URL` (и `SPEECH_KEY`), поток речи не загружает моделей: каждый `.opus` из очереди уходит на воркер распознавания (`POST /v1/jobs` с заголовком `X-Client-Key`, затем `GET /v1/jobs/<id>` до `done` и `POST /v1/jobs/<id>/ack`), фразы и звуковые события берутся из ответа. Чёрный список и нарезка клипов остаются на месте. `SPEECH_LANGUAGE` (по умолчанию `ru`, `auto` для определения) передаётся воркеру. Без `SPEECH_URL` всё работает в контейнере, как раньше.
 
 ### Безопасность и ресурсы
 
